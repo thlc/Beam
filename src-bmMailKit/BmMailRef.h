@@ -49,6 +49,8 @@ class IMPEXPBMMAILKIT BmMailRef : public BmListModelItem {
 	static const char* const MSG_CLASSIFICATION;
 	static const char* const MSG_RATIO_SPAM;
 	static const char* const MSG_IMAP_UID;
+	static const char* const MSG_IMAP_FOLDER;
+	static const char* const MSG_FLAGGED;
 	static const int16 nArchiveVersion;
 
 public:
@@ -58,11 +60,12 @@ public:
 	virtual ~BmMailRef();
 
 	// native methods:
-	void MarkAs(const char* s);
+	void MarkAs(const char* s, bool queueForServer = true);
 	bool ReadAttributes(const struct stat* statInfo = NULL, BmUpdFlags* updFlagsOut = NULL);
 	void ResyncFromDisk(entry_ref* newRef = NULL, const struct stat* statInfo = NULL);
 	void MarkAsSpam();
 	void MarkAsTofu();
+	void SetFlagged(bool flagged, bool queueForServer = true);
 
 	// overrides of archivable base:
 	status_t Archive(BMessage* archive, bool deep = true) const;
@@ -75,6 +78,8 @@ public:
 	inline const node_ref& NodeRef() const { return mNodeRef; }
 	inline status_t InitCheck() const { return mInitCheck; }
 	inline const BmString& ImapUID() const { return mImapUID; }
+	inline const BmString& ImapFolder() const { return mImapFolder; }
+	inline bool IsFlagged() const { return mFlagged; }
 	inline const BmString& Account() const { return mAccount; }
 	inline const BmString& Cc() const { return mCc; }
 	inline const BmString& From() const { return mFrom; }
@@ -120,6 +125,7 @@ public:
 	static const BmUpdFlags UPD_CLASSIFICATION = 1 << 17;
 	static const BmUpdFlags UPD_RATIO_SPAM = 1 << 18;
 	static const BmUpdFlags UPD_IMAP_UID = 1 << 19;
+	static const BmUpdFlags UPD_FLAGGED = 1 << 20;
 
 	// indicates whether an item has been added or removed
 	static const float UNKNOWN_RATIO;
@@ -132,11 +138,14 @@ protected:
 
 private:
 	void MarkAsSpamOrTofu(bool asSpam);
+	void QueueFlagChangeForServer();
 
 	// the following members will be archived as part of BmFolderList:
 	entry_ref mEntryRef;
 	node_ref mNodeRef;
 	BmString mImapUID;
+	BmString mImapFolder;
+	bool mFlagged;
 	BmString mAccount;
 	BmString mCc;
 	BmString mFrom;

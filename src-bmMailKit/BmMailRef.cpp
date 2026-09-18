@@ -12,6 +12,7 @@
 #include <NodeMonitor.h>
 
 #include "BmBasics.h"
+#include "BmImapAccount.h"
 #include "BmLogHandler.h"
 #include "BmMail.h"
 #include "BmMailFolderList.h"
@@ -19,6 +20,7 @@
 #include "BmMailRef.h"
 #include "BmMailRefList.h"
 #include "BmPrefs.h"
+#include "BmRecvAccount.h"
 #include "BmRoster.h"
 #include "BmStorageUtil.h"
 #include "BmUtil.h"
@@ -50,7 +52,9 @@ const char* const BmMailRef::MSG_IS_VALID = "bm:iv";
 const char* const BmMailRef::MSG_CLASSIFICATION = "bm:cl";
 const char* const BmMailRef::MSG_RATIO_SPAM = "bm:rs";
 const char* const BmMailRef::MSG_IMAP_UID = "bm:ui";
-const int16 BmMailRef::nArchiveVersion = 6;
+const char* const BmMailRef::MSG_IMAP_FOLDER = "bm:if";
+const char* const BmMailRef::MSG_FLAGGED = "bm:fl";
+const int16 BmMailRef::nArchiveVersion = 7;
 
 const float BmMailRef::UNKNOWN_RATIO = 10.0;
 // just anything outside of [0..1]
@@ -137,6 +141,7 @@ BmMailRef::CreateInstance(BMessage* archive)
 BmMailRef::BmMailRef(entry_ref& eref, const node_ref& nref)
 	: inherited(BM_REFKEY(nref), NULL, (BmListModelItem*)NULL),
 	  mEntryRef(eref),
+	  mFlagged(false),
 	  mWhen(0),
 	  mWhenCreated(0),
 	  mSize(0),
@@ -154,6 +159,7 @@ BmMailRef::BmMailRef(entry_ref& eref, const node_ref& nref)
 BmMailRef::BmMailRef(entry_ref& eref, struct stat& st)
 	: inherited(BM_REFKEYSTAT(st), NULL, (BmListModelItem*)NULL),
 	  mEntryRef(eref),
+	  mFlagged(false),
 	  mWhen(0),
 	  mWhenCreated(0),
 	  mSize(0),
@@ -171,6 +177,7 @@ BmMailRef::BmMailRef(entry_ref& eref, struct stat& st)
 \*------------------------------------------------------------------------------*/
 BmMailRef::BmMailRef(BMessage* archive, node_ref& nref)
 	: inherited("", NULL, (BmListModelItem*)NULL),
+	  mFlagged(false),
 	  mWhen(0),
 	  mWhenCreated(0),
 	  mSize(0),
@@ -228,6 +235,11 @@ BmMailRef::BmMailRef(BMessage* archive, node_ref& nref)
 			mImapUID = FindMsgString(archive, MSG_IMAP_UID);
 		}
 
+		if (version >= 7) {
+			mImapFolder = FindMsgString(archive, MSG_IMAP_FOLDER);
+			mFlagged = FindMsgBool(archive, MSG_FLAGGED);
+		}
+
 		mSizeString = BytesToString(int32(mSize), true);
 		if (mRatioSpam != UNKNOWN_RATIO)
 			mRatioSpamString << mRatioSpam;
@@ -278,7 +290,9 @@ BmMailRef::Archive(BMessage* archive, bool) const
 #endif
 		  || archive->AddString(MSG_CLASSIFICATION, mClassification.String())
 		  || archive->AddFloat(MSG_RATIO_SPAM, mRatioSpam)
-		  || archive->AddString(MSG_IMAP_UID, mImapUID.String());
+		  || archive->AddString(MSG_IMAP_UID, mImapUID.String())
+		  || archive->AddString(MSG_IMAP_FOLDER, mImapFolder.String())
+		  || archive->AddBool(MSG_FLAGGED, mFlagged);
 	return ret;
 }
 
@@ -337,6 +351,13 @@ BmMailRef::ReadAttributes(const struct stat* statInfo, BmUpdFlags* updFlagsOut)
 			updFlags |= UPD_NAME;
 		if (BmReadStringAttr(&node, BM_MAIL_ATTR_IMAP_UID, mImapUID))
 			updFlags |= UPD_IMAP_UID;
+		BmReadStringAttr(&node, BM_MAIL_ATTR_IMAP_FOLDER, mImapFolder);
+		bool flagged = false;
+		node.ReadAttr(BM_MAIL_ATTR_FLAGGED, B_BOOL_TYPE, 0, &flagged, sizeof(flagged));
+		if (mFlagged != flagged) {
+			mFlagged = flagged;
+			updFlags |= UPD_FLAGGED;
+		}
 		if (BmReadStringAttr(&node, BM_MAIL_ATTR_ACCOUNT, mAccount))
 			updFlags |= UPD_ACCOUNT;
 		if (BmReadStringAttr(&node, BM_MAIL_ATTR_CC, mCc))
@@ -440,6 +461,8 @@ BmMailRef::ReadAttributes(const struct stat* statInfo, BmUpdFlags* updFlagsOut)
 		// item is no mail, we mark it as invalid:
 		mName = "";
 		mImapUID = "";
+		mImapFolder = "";
+		mFlagged = false;
 		mAccount = "";
 		mCc = "";
 		mFrom = "";
@@ -504,10 +527,15 @@ BmMailRef::IsSpecial() const
 
 /*------------------------------------------------------------------------------*\
 	MarkAs()
-		-
+		-	queueForServer distinguishes local-origin changes (UI actions,
+			filter rules - the default) from server-origin ones (IMAP pulling
+			down the server's current flags): only local-origin changes get
+			queued for pushing back to the server, to avoid an echo loop
+			where a pulled status change would immediately be re-queued as
+			an (identical, redundant) outbound change.
 \*------------------------------------------------------------------------------*/
 void
-BmMailRef::MarkAs(const char* status)
+BmMailRef::MarkAs(const char* status, bool queueForServer)
 {
 	if (InitCheck() != B_OK || mStatus == status)
 		return;
@@ -536,9 +564,76 @@ BmMailRef::MarkAs(const char* status)
 		BmMailRefList* refList = dynamic_cast<BmMailRefList*>(listModel.Get());
 		if (refList)
 			refList->MarkAsChanged();
+		if (queueForServer)
+			QueueFlagChangeForServer();
 	} catch (BM_error& e) {
 		BM_SHOWERR(e.what());
 	}
+}
+
+/*------------------------------------------------------------------------------*\
+	SetFlagged()
+		-	mirrors MarkAs(), for IMAP's independent \Flagged flag (which has
+			no room in Beam's single-value status attribute).
+\*------------------------------------------------------------------------------*/
+void
+BmMailRef::SetFlagged(bool flagged, bool queueForServer)
+{
+	if (InitCheck() != B_OK || mFlagged == flagged)
+		return;
+	try {
+		BNode mailNode;
+		status_t err;
+		mFlagged = flagged;
+		if ((err = mailNode.SetTo(&mEntryRef)) != B_OK)
+			BM_THROW_RUNTIME(BmString("Could not create node for current mail-file.\n\n"
+									  " Result: ")
+							 << strerror(err));
+		node_ref folderNodeRef;
+		folderNodeRef.node = mEntryRef.directory;
+		folderNodeRef.device = mEntryRef.device;
+		BmString folderKey(BM_REFKEY(folderNodeRef));
+		TheMailMonitor->CacheRefToFolder(mNodeRef, folderKey);
+		mailNode.RemoveAttr(BM_MAIL_ATTR_FLAGGED);
+		mailNode.WriteAttr(BM_MAIL_ATTR_FLAGGED, B_BOOL_TYPE, 0, &flagged, sizeof(bool));
+		TellModelItemUpdated(UPD_FLAGGED);
+		BmRef<BmListModel> listModel(ListModel());
+		BmMailRefList* refList = dynamic_cast<BmMailRefList*>(listModel.Get());
+		if (refList)
+			refList->MarkAsChanged();
+		if (queueForServer)
+			QueueFlagChangeForServer();
+	} catch (BM_error& e) {
+		BM_SHOWERR(e.what());
+	}
+}
+
+/*------------------------------------------------------------------------------*\
+	QueueFlagChangeForServer()
+		-	if this mail originates from an IMAP account, translates its
+			current status+flagged state into an IMAP flags bitmask and
+			queues it on that account, to be pushed via UID STORE at the
+			start of the next check for its remote folder.
+\*------------------------------------------------------------------------------*/
+void
+BmMailRef::QueueFlagChangeForServer()
+{
+	if (!mAccount.Length() || !mImapUID.Length() || !mImapFolder.Length())
+		return;
+	BmRef<BmListModelItem> accItem = TheRecvAccountList->FindItemByKey(mAccount);
+	BmImapAccount* imapAcc = dynamic_cast<BmImapAccount*>(accItem.Get());
+	if (!imapAcc)
+		return;
+	uint32 flags = 0;
+	if (mStatus == BM_MAIL_STATUS_READ || mStatus == BM_MAIL_STATUS_REPLIED)
+		flags |= BM_IMAP_FLAG_SEEN;
+	if (mStatus == BM_MAIL_STATUS_REPLIED)
+		flags |= BM_IMAP_FLAG_ANSWERED;
+	if (mStatus == BM_MAIL_STATUS_DRAFT)
+		flags |= BM_IMAP_FLAG_DRAFT;
+	if (mFlagged)
+		flags |= BM_IMAP_FLAG_FLAGGED;
+	imapAcc->QueueOutboundFlags(mImapFolder, mImapUID, flags);
 }
 
 /*------------------------------------------------------------------------------*\

@@ -55,6 +55,7 @@ enum {
 	BMM_PREVIOUS_MESSAGE = 'bMdu',
 	BMM_NARROW_DOWN = 'bMdv',
 	BMM_SET_TIME_SPAN = 'bMdw',
+	BMM_TOGGLE_FLAGGED = 'bMdx',
 
 	// mail edit window
 	BMM_ATTACH = 'bMea',

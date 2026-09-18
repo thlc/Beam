@@ -13,6 +13,7 @@
 #ifdef BEAM_FOR_BONE
 #include <netinet/in.h>
 #endif
+#include <Directory.h>
 #include <NetAddress.h>
 #include <NetEndpoint.h>
 
@@ -28,14 +29,113 @@ using namespace regexx;
 #include "BmImapAccount.h"
 #include "BmLogHandler.h"
 #include "BmMail.h"
+#include "BmMailFolderList.h"
 #include "BmNetEndpointRoster.h"
 #include "BmPrefs.h"
 #include "BmRosterBase.h"
+#include "BmStorageUtil.h"
 #include "BmUtil.h"
 
 // standard logfile-name for this class:
 #undef BM_LOGNAME
 #define BM_LOGNAME Name()
+
+/*------------------------------------------------------------------------------*\
+	UnquoteImapString( token)
+		-	strips surrounding double-quotes (and un-escapes \" and \\) from an
+			IMAP quoted-string; returns the token unchanged if it isn't quoted.
+		-	does NOT handle IMAP literals ({n}\r\n...) or modified UTF-7
+			encoded mailbox names - servers using those for basic mailbox
+			names (INBOX, INBOX/Foo, ...) are not expected in practice.
+\*------------------------------------------------------------------------------*/
+static BmString
+UnquoteImapString(const BmString& token)
+{
+	if (token.Length() >= 2 && token.ByteAt(0) == '"' && token.ByteAt(token.Length() - 1) == '"') {
+		BmString result;
+		token.CopyInto(result, 1, token.Length() - 2);
+		result.ReplaceAll("\\\"", "\"");
+		result.ReplaceAll("\\\\", "\\");
+		return result;
+	}
+	return token;
+}
+
+/*------------------------------------------------------------------------------*\
+	QuoteImapString( str)
+		-	wraps the given string in double-quotes for use as an IMAP
+			quoted-string, escaping any '\' or '"' it contains.
+\*------------------------------------------------------------------------------*/
+static BmString
+QuoteImapString(const BmString& str)
+{
+	BmString escaped = str;
+	escaped.ReplaceAll("\\", "\\\\");
+	escaped.ReplaceAll("\"", "\\\"");
+	return BmString("\"") << escaped << "\"";
+}
+
+/*------------------------------------------------------------------------------*\
+	CollectLocalImapRefs( localSubPath)
+		-	scans the given local folder's on-disk contents directly (rather
+			than going through its BmMailRefList, which may not have been
+			loaded/populated yet) and builds a uid -> BmMailRef map for every
+			mail found that carries a BM_MAIL_ATTR_IMAP_UID attribute.
+		-	uses BmMailRef::CreateInstance(), which transparently returns the
+			live, already-loaded ref if one exists (global ref-cache keyed by
+			node_ref), so this never creates duplicate BmMailRef objects.
+\*------------------------------------------------------------------------------*/
+static map<BmString, BmRef<BmMailRef> >
+CollectLocalImapRefs(const BmString& localSubPath)
+{
+	map<BmString, BmRef<BmMailRef> > result;
+	if (!localSubPath.Length())
+		return result;
+	BmString fullPath = ThePrefs->GetString("MailboxPath") + "/" + localSubPath;
+	BDirectory dir(fullPath.String());
+	if (dir.InitCheck() != B_OK)
+		return result;
+	entry_ref eref;
+	while (dir.GetNextRef(&eref) == B_OK) {
+		BNode node(&eref);
+		if (node.InitCheck() != B_OK)
+			continue;
+		BmString uid;
+		if (!BmReadStringAttr(&node, BM_MAIL_ATTR_IMAP_UID, uid) || !uid.Length())
+			continue;
+		struct stat st;
+		if (node.GetStat(&st) != B_OK)
+			continue;
+		BmRef<BmMailRef> ref = BmMailRef::CreateInstance(eref, &st);
+		if (ref)
+			result[uid] = ref;
+	}
+	return result;
+}
+
+/*------------------------------------------------------------------------------*\
+	MapImapFlagsToStatus( flags, currentStatus)
+		-	translates a fetched IMAP flags-bitmask into the corresponding
+			local status string, for reconciling already-downloaded mail.
+		-	only reconciles among the states IMAP flags can actually
+			represent; returns NULL (meaning "leave unchanged") for any
+			local-only status IMAP has no equivalent for.
+\*------------------------------------------------------------------------------*/
+static const char*
+MapImapFlagsToStatus(uint32 flags, const BmString& currentStatus)
+{
+	if (currentStatus.Length() && currentStatus != BM_MAIL_STATUS_NEW
+		&& currentStatus != BM_MAIL_STATUS_READ && currentStatus != BM_MAIL_STATUS_REPLIED
+		&& currentStatus != BM_MAIL_STATUS_DRAFT)
+		return NULL;
+	if (flags & BM_IMAP_FLAG_ANSWERED)
+		return BM_MAIL_STATUS_REPLIED;
+	if (flags & BM_IMAP_FLAG_SEEN)
+		return BM_MAIL_STATUS_READ;
+	if (flags & BM_IMAP_FLAG_DRAFT)
+		return BM_MAIL_STATUS_DRAFT;
+	return BM_MAIL_STATUS_NEW;
+}
 
 /********************************************************************************\
 	BmImapStatusFilter
@@ -190,7 +290,8 @@ int32 BmImap::mId = 0;
 BmImap::ImapState BmImap::ImapStates[BmImap::IMAP_FINAL]
 	= {ImapState("connect...", &BmImap::StateConnect), ImapState("capa...", &BmImap::StateCapa),
 		ImapState("starttls...", &BmImap::StateStartTLS), ImapState("auth...", &BmImap::StateAuth),
-		ImapState("check...", &BmImap::StateCheck), ImapState("cleanup...", &BmImap::StateCleanup),
+		ImapState("list...", &BmImap::StateList), ImapState("check...", &BmImap::StateCheck),
+		ImapState("cleanup...", &BmImap::StateCleanup),
 		ImapState("get...", &BmImap::StateRetrieve), ImapState("quit...", &BmImap::StateDisconnect),
 		ImapState("done", NULL)};
 
@@ -202,11 +303,9 @@ BmImap::BmImap(const BmString& name, BmImapAccount* account)
 	: inherited(BmString("IMAP_") << name, BM_LogRecv, new BmImapStatusFilter(NULL, this)),
 	  mImapAccount(account),
 	  mCurrMailNr(0),
-	  mMsgCount(0),
 	  mNewMsgCount(0),
 	  mNewMsgTotalSize(1),
 	  mServerSupportsTLS(false),
-	  mExpungeCount(0),
 	  mState(0),
 	  mTaggedMode(false),
 	  mCurrTagNr(0)
@@ -267,6 +366,7 @@ BmImap::StartJob()
 		// when checking capabilities, we skip nearly everything:
 		ImapStates[IMAP_STARTTLS].skip = true;
 		ImapStates[IMAP_AUTH].skip = true;
+		ImapStates[IMAP_LIST].skip = true;
 		ImapStates[IMAP_CHECK].skip = true;
 		ImapStates[IMAP_RETRIEVE].skip = true;
 	}
@@ -376,7 +476,7 @@ void
 BmImap::UpdateCleanupStatus(const float delta, int32 currMsg)
 {
 	BmString text;
-	uint32 count = (uint32)mCleanupMsgUIDs.size();
+	uint32 count = (uint32)mCleanupItems.size();
 	if (count > 0) {
 		text = BmString() << currMsg << " of " << count;
 	} else {
@@ -594,190 +694,480 @@ BmImap::StateAuth()
 }
 
 /*------------------------------------------------------------------------------*\
+	EnsureLocalFolderExists( subPath)
+		-	makes sure a local mail-folder exists at the given sub-path
+			(relative to the mailbox-root), creating it (and waiting for the
+			node-monitor to pick it up) if necessary.
+		-	walks subPath one segment at a time (instead of handing the whole
+			multi-level path to a single create_directory() call): creating a
+			child folder can implicitly create its not-yet-existing parent
+			(create_directory() creates all missing intermediate
+			directories), but the parent's node-monitor watch is only armed
+			once its own creation has round-tripped through the node-monitor
+			and been turned into a BmMailFolder - if the child is created in
+			that same call, its creation happens before the parent's watch is
+			active, and its creation-event is never sent (not delayed, lost
+			for good). Ensuring each parent level is fully registered before
+			creating the next child avoids that race, for any nesting depth.
+		-	returns false if the folder could not be created/found within a
+			reasonable time.
+\*------------------------------------------------------------------------------*/
+bool
+BmImap::EnsureLocalFolderExists(const BmString& subPath)
+{
+	if (!subPath.Length())
+		return true;
+
+	BmString partialPath;
+	int32 start = 0;
+	while (start <= subPath.Length()) {
+		int32 slashPos = subPath.FindFirst('/', start);
+		int32 end = slashPos >= 0 ? slashPos : subPath.Length();
+		BmString component;
+		subPath.CopyInto(component, start, end - start);
+		if (partialPath.Length())
+			partialPath << "/";
+		partialPath << component;
+
+		if (!TheMailFolderList->FindMailFolderBySubPath(partialPath)) {
+			BmString fullPath = ThePrefs->GetString("MailboxPath") + "/" + partialPath;
+			create_directory(fullPath.String(), 0755);
+			bool found = false;
+			for (int i = 0; i < 100 && !found; ++i) {
+				if (TheMailFolderList->FindMailFolderBySubPath(partialPath))
+					found = true;
+				else
+					snooze(100 * 1000);
+			}
+			if (!found)
+				return false;
+		}
+
+		if (slashPos < 0)
+			break;
+		start = slashPos + 1;
+	}
+	return true;
+}
+
+/*------------------------------------------------------------------------------*\
+	SelectFolder( remoteName, existsCount, uidValidity)
+		-	selects the given mailbox on the server.
+		-	if existsCount/uidValidity are given, the corresponding info from
+			the server's answer is extracted into them.
+\*------------------------------------------------------------------------------*/
+bool
+BmImap::SelectFolder(const BmString& remoteName, uint32* existsCount, BmString* uidValidity)
+{
+	BmString cmd = BmString("SELECT ") << QuoteImapString(remoteName);
+	SendCommand(cmd);
+	if (!CheckForPositiveAnswer())
+		return false;
+	if (existsCount) {
+		Regexx rx;
+		if (!rx.exec(StatusText(), "\\*\\s+(\\d+)\\s+exists", Regexx::newline | Regexx::nocase))
+			throw BM_network_error(BmString("answer to '") << cmd << "' has unknown format");
+		BmString msgCountStr = rx.match[0].atom[0];
+		int32 count = atoi(msgCountStr.String());
+		*existsCount = count > 0 ? (uint32)count : 0;
+	}
+	if (uidValidity) {
+		Regexx rx;
+		if (rx.exec(StatusText(), "\\buidvalidity\\s+(\\d+)", Regexx::newline | Regexx::nocase))
+			*uidValidity = rx.match[0].atom[0];
+		else
+			uidValidity->Truncate(0);
+	}
+	return true;
+}
+
+/*------------------------------------------------------------------------------*\
+	FlushPendingOutboundFlags( folder)
+		-	pushes any local flag-changes queued for this remote folder (via
+			BmMailRef::MarkAs()/SetFlagged() on IMAP-origin mail) as UID
+			STORE commands, then clears them - called right after SELECTing
+			the folder, before pulling the server's current flags, so that
+			our own pending changes aren't immediately overwritten by a pull
+			of the (about to become stale) previous server state.
+\*------------------------------------------------------------------------------*/
+void
+BmImap::FlushPendingOutboundFlags(const BmImapFolderInfo& folder)
+{
+	map<BmString, uint32> pending = mImapAccount->PendingOutboundFlags(folder.remoteName);
+	map<BmString, uint32>::const_iterator iter;
+	for (iter = pending.begin(); iter != pending.end(); ++iter) {
+		BmString serverUID = LocalUidToServerUid(iter->first);
+		BmString cmd = BmString("UID STORE ") << serverUID << " FLAGS ("
+											   << FlagsToString(iter->second) << ")";
+		SendCommand(cmd);
+		if (!CheckForPositiveAnswer())
+			throw BM_network_error(BmString("answer to '") << cmd << "' failed");
+		mImapAccount->ClearPendingOutboundFlags(folder.remoteName, iter->first);
+	}
+}
+
+/*------------------------------------------------------------------------------*\
+	ReconcilePulledFlags( folder, msgCount)
+		-	for every message in the folder that we already know about (i.e.
+			NOT a newly-downloaded one - those get their initial local status
+			set directly in RetrieveOneFolder()), compares the flags just
+			pulled via FETCH against the corresponding local mail's current
+			status/flagged state, and applies any difference locally
+			(last-write-wins: whichever side changed since the last check
+			simply overwrites the other, we have no other way to tell "who
+			changed last" across two independent systems).
+		-	only reconciles among the states IMAP flags can actually
+			represent (New/Read/Replied/Draft); any other local-only status
+			(Forwarded/Redirected/Sent/Pending/Error/...) is left untouched,
+			since the server has no equivalent for those.
+		-	applied via the "server-origin" (queueForServer=false) path, so
+			this does not immediately re-queue the very change we just
+			pulled as a redundant outbound push.
+\*------------------------------------------------------------------------------*/
+void
+BmImap::ReconcilePulledFlags(const BmImapFolderInfo& folder, uint32 msgCount)
+{
+	bool haveLocalRefs = false;
+	map<BmString, BmRef<BmMailRef> > localRefs;
+	for (uint32 i = 0; i < msgCount; ++i) {
+		if (!mImapAccount->IsUIDDownloaded(folder.remoteName, folder.uids[i]))
+			continue;  // not downloaded yet, nothing to reconcile
+		if (!haveLocalRefs) {
+			localRefs = CollectLocalImapRefs(folder.localSubPath);
+			haveLocalRefs = true;
+		}
+		map<BmString, BmRef<BmMailRef> >::const_iterator iter = localRefs.find(folder.uids[i]);
+		if (iter == localRefs.end())
+			continue;  // couldn't locate the local mail (e.g. moved/deleted locally)
+		BmRef<BmMailRef> ref = iter->second;
+		uint32 serverFlags = folder.flags[i];
+		const char* newStatus = MapImapFlagsToStatus(serverFlags, ref->Status());
+		if (newStatus && ref->Status() != newStatus)
+			ref->MarkAs(newStatus, false);
+		bool newFlagged = (serverFlags & BM_IMAP_FLAG_FLAGGED) != 0;
+		if (ref->IsFlagged() != newFlagged)
+			ref->SetFlagged(newFlagged, false);
+	}
+}
+
+/*------------------------------------------------------------------------------*\
+	StateList()
+		-	discovers the mailboxes available on the server, and figures out
+			which of them are to be synced (and into which local folder).
+\*------------------------------------------------------------------------------*/
+void
+BmImap::StateList()
+{
+	BmString cmd("LIST \"\" \"*\"");
+	SendCommand(cmd);
+	if (!CheckForPositiveAnswer())
+		return;
+
+	Regexx rx;
+	uint32 count = rx.exec(StatusText(),
+		"^\\*\\s+LIST\\s+\\(([^)]*)\\)\\s+(\"[^\"]*\"|NIL)\\s+([^\\r\\n]+)$",
+		Regexx::newline | Regexx::nocase | Regexx::global);
+
+	mFolders.clear();
+	bool haveInbox = false;
+	for (uint32 i = 0; i < count; ++i) {
+		BmString attrs = rx.match[i].atom[0];
+		BmString delimTok = rx.match[i].atom[1];
+		BmString nameTok = rx.match[i].atom[2];
+
+		bool noSelect = attrs.IFindFirst("\\Noselect") >= 0;
+
+		char delimiter = 0;
+		if (delimTok.ICompare("NIL") != 0 && delimTok.Length() >= 3)
+			delimiter = delimTok.ByteAt(1);
+
+		BmString remoteName = UnquoteImapString(nameTok);
+		if (remoteName.ICompare("INBOX") == 0)
+			haveInbox = true;
+
+		if (noSelect || !mImapAccount->ShouldSyncFolder(remoteName))
+			continue;
+
+		BmImapFolderInfo info;
+		info.remoteName = remoteName;
+		info.delimiter = delimiter;
+		info.localSubPath = mImapAccount->LocalSubPathForRemoteFolder(remoteName, delimiter);
+		mFolders.push_back(info);
+	}
+
+	if (!haveInbox) {
+		// some servers omit INBOX from the LIST-answer, but we always want
+		// to sync it, to stay consistent with earlier (inbox-only) versions:
+		BmImapFolderInfo info;
+		info.remoteName = "INBOX";
+		info.localSubPath = mImapAccount->HomeFolder();
+		mFolders.insert(mFolders.begin(), info);
+	}
+
+	for (uint32 i = 0; i < mFolders.size(); ++i) {
+		if (!EnsureLocalFolderExists(mFolders[i].localSubPath)) {
+			BM_LOG(BM_LogRecv, BmString("Could not create/find local folder '")
+									<< mFolders[i].localSubPath << "' for IMAP-mailbox '"
+									<< mFolders[i].remoteName << "'.");
+		}
+	}
+}
+
+/*------------------------------------------------------------------------------*\
 	StateCheck()
-		-	looks for new mail (only in inbox)
+		-	looks for new mail in every synced mailbox
 \*------------------------------------------------------------------------------*/
 void
 BmImap::StateCheck()
 {
-	// select inbox and fetch number of existing messages...
-	BmString cmd("SELECT inbox");
-	SendCommand(cmd);
-	if (!CheckForPositiveAnswer())
-		return;
-	Regexx rx;
-	if (!rx.exec(StatusText(), "\\*\\s+(\\d+)\\s+exists", Regexx::newline | Regexx::nocase))
-		throw BM_network_error(BmString("answer to '") << cmd << "' has unknown format");
-	BmString msgCountStr = rx.match[0].atom[0];
-	mMsgCount = atoi(msgCountStr.String());
-	if (mMsgCount < 0)
-		mMsgCount = 0;
-	// ...and uidvalidity (domain of UIDs)
-	BmString uidValidity;
-	if (rx.exec(StatusText(), "\\buidvalidity\\s+(\\d+)", Regexx::newline | Regexx::nocase))
-		uidValidity = rx.match[0].atom[0];
-
 	mNewMsgTotalSize = 0;
 	mNewMsgCount = 0;
-	mCleanupMsgUIDs.clear();
-	if (mMsgCount) {
-		// fetch list with uid and size of every message:
-		// add "flags" here to the list of data to fetch.
-		cmd = BmString("FETCH 1:") << mMsgCount << " (uid rfc822.size flags)";
-		SendCommand(cmd);
-		if (!CheckForPositiveAnswer())
+	mNewMsgSizes.clear();
+	mCleanupItems.clear();
+
+	for (uint32 f = 0; f < mFolders.size(); ++f) {
+		if (!CheckOneFolder(mFolders[f], f))
 			return;
-		const BmString& status = StatusText();
-		uint32 fetchedCount = rx.exec(status, "^\\*\\s+(\\d+)\\s+fetch\\s+(\\([^\\r\\n]*\\))",
-			Regexx::newline | Regexx::nocase | Regexx::global);
-		if (!fetchedCount)
-			throw BM_network_error(BmString("answer to '") << cmd << "' has unknown format");
-		if (fetchedCount != mMsgCount) {
-			BM_LOG(BM_LogRecv, BmString("Strange: server indicated ")
-								   << mMsgCount << " mails, but FETCH received " << fetchedCount
-								   << " lines!");
-			if (fetchedCount > mMsgCount)
-				fetchedCount = mMsgCount;
-		}
-		// grab individual UID, flags and message size from result:
-		vector<uint32> msgSizes;
-		mMsgFlags.clear();
-		mMsgUIDs.clear();
-		BmImapNestedStringList nestedList;
-		for (uint32 i = 0; i < fetchedCount; ++i) {
-			BmString nrStr = rx.match[i].atom[0];
-			uint32 nr = atoi(nrStr.String());
-			if (nr != i + 1)
-				throw BM_network_error(
-					BmString("answer to '") << cmd << "' has unexpected msg-nr. in line " << i + 1);
-			const char* posInText = status.String() + rx.match[i].atom[1].start();
-			if (!nestedList.Parse(posInText))
-				throw BM_network_error(BmString("answer to '")
-									   << cmd << "' has unparsable string list in line " << i + 1);
-			uint32 listSize = (uint32)nestedList.Size();
-			if (listSize % 2 != 0)
-				throw BM_network_error(BmString("answer to '")
-									   << cmd << "' has uneven number of items "
-									   << "in string list in line " << i + 1);
-			for (uint32 l = 0; l < listSize; l += 2) {
-				const BmString& key = nestedList[l].Text();
-				if (key.ICompare("UID") == 0) {
-					// compose our uid as "uidvalidity:uid", such that we never
-					// confuse UIDs, should the server decide to renumber the messages:
-					BmString uid = uidValidity + ":" + nestedList[l + 1].Text();
-					mMsgUIDs.push_back(uid);
-				} else if (key.ICompare("FLAGS") == 0) {
-					unsigned flags = StringToFlags(nestedList[l + 1]);
-					mMsgFlags.push_back(flags);
-				} else if (key.ICompare("RFC822.SIZE") == 0) {
-					const BmString& sizeStr = nestedList[l + 1].Text();
-					msgSizes.push_back(atoi(sizeStr.String()));
-				} else
-					throw BM_network_error(BmString("answer to '")
-										   << cmd << "' contains unrequested key '" << key
-										   << "' in string list in line " << i + 1);
-			}
-			if (mMsgUIDs.size() != i + 1)
-				throw BM_network_error(
-					BmString("answer to '") << cmd << "' is missing UID in line " << i + 1);
-			if (mMsgFlags.size() != i + 1)
-				throw BM_network_error(
-					BmString("answer to '") << cmd << "' is missing FLAGS in line " << i + 1);
-			if (msgSizes.size() != i + 1)
-				throw BM_network_error(
-					BmString("answer to '") << cmd << "' is missing RFC822.SIZE in line " << i + 1);
-		}
-
-		if (mMsgUIDs.size() != mMsgCount)
-			throw BM_network_error(BmString("answer to '") << cmd << "' does not have enough UIDs");
-		if (mMsgFlags.size() != mMsgCount)
-			throw BM_network_error(
-				BmString("answer to '") << cmd << "' does not have enough FLAGS");
-		if (msgSizes.size() != mMsgCount)
-			throw BM_network_error(
-				BmString("answer to '") << cmd << "' does not have enough RFC822.SIZEs");
-
-		// compute total size of messages that are new to us:
-		for (uint32 i = 0; i < mMsgCount; i++) {
-			if (!mImapAccount->IsUIDDownloaded(mMsgUIDs[i])) {
-				// msg is new (according to unknown UID)
-				// add msg-size to total:
-				mNewMsgTotalSize += msgSizes[i];
-				mNewMsgSizes.push_back(msgSizes[i]);
-				mNewMsgCount++;
-			} else {
-				// msg is old (according to known UID), we may have to remove it now:
-				BmString log;
-				bool shouldBeRemoved = mImapAccount->ShouldUIDBeDeletedFromServer(mMsgUIDs[i], log);
-				BM_LOG2(BM_LogRecv, log);
-				if (shouldBeRemoved) {
-					// store msg-UID for cleanup state
-					mCleanupMsgUIDs.push_back(mMsgUIDs[i]);
-				}
-			}
-		}
 	}
-
-	// remove local UIDs that are not listed on the server anymore:
-	BmString removedUids = mImapAccount->AdjustToCurrentServerUids(mMsgUIDs);
-	BM_LOG(BM_LogRecv, removedUids);
 
 	if (mNewMsgCount == 0)
 		UpdateMailStatus(0, NULL, 0);
 }
 
 /*------------------------------------------------------------------------------*\
+	CheckOneFolder( folder)
+		-	selects one mailbox and fetches uid/size/flags of every message in
+			it, then figures out which of them are new (and thus need to be
+			retrieved) and which old ones should be removed from the server.
+\*------------------------------------------------------------------------------*/
+bool
+BmImap::CheckOneFolder(BmImapFolderInfo& folder, uint32 folderIdx)
+{
+	uint32 msgCount = 0;
+	BmString uidValidity;
+	if (!SelectFolder(folder.remoteName, &msgCount, &uidValidity))
+		return false;
+	folder.msgCount = msgCount;
+	folder.uidValidity = uidValidity;
+	mImapAccount->UidValidityForFolder(folder.remoteName, uidValidity);
+
+	// push any locally-queued flag-changes (marked read/replied/flagged/draft
+	// while offline, or since the last check) before pulling the server's
+	// current state:
+	FlushPendingOutboundFlags(folder);
+
+	folder.uids.clear();
+	folder.flags.clear();
+	if (!msgCount)
+		return true;
+
+	BmString cmd = BmString("FETCH 1:") << msgCount << " (uid rfc822.size flags)";
+	SendCommand(cmd);
+	if (!CheckForPositiveAnswer())
+		return false;
+	Regexx rx;
+	const BmString& status = StatusText();
+	uint32 fetchedCount = rx.exec(status, "^\\*\\s+(\\d+)\\s+fetch\\s+(\\([^\\r\\n]*\\))",
+		Regexx::newline | Regexx::nocase | Regexx::global);
+	if (!fetchedCount)
+		throw BM_network_error(BmString("answer to '") << cmd << "' has unknown format");
+	if (fetchedCount != msgCount) {
+		BM_LOG(BM_LogRecv, BmString("Strange: server indicated ")
+								<< msgCount << " mails in folder " << folder.remoteName
+								<< ", but FETCH received " << fetchedCount << " lines!");
+		if (fetchedCount > msgCount)
+			fetchedCount = msgCount;
+	}
+
+	vector<uint32> msgSizes;
+	BmImapNestedStringList nestedList;
+	for (uint32 i = 0; i < fetchedCount; ++i) {
+		BmString nrStr = rx.match[i].atom[0];
+		uint32 nr = atoi(nrStr.String());
+		if (nr != i + 1)
+			throw BM_network_error(
+				BmString("answer to '") << cmd << "' has unexpected msg-nr. in line " << i + 1);
+		const char* posInText = status.String() + rx.match[i].atom[1].start();
+		if (!nestedList.Parse(posInText))
+			throw BM_network_error(BmString("answer to '")
+								   << cmd << "' has unparsable string list in line " << i + 1);
+		uint32 listSize = (uint32)nestedList.Size();
+		if (listSize % 2 != 0)
+			throw BM_network_error(BmString("answer to '")
+								   << cmd << "' has uneven number of items "
+								   << "in string list in line " << i + 1);
+		for (uint32 l = 0; l < listSize; l += 2) {
+			const BmString& key = nestedList[l].Text();
+			if (key.ICompare("UID") == 0) {
+				// compose our uid as "uidvalidity:uid", such that we never
+				// confuse UIDs, should the server decide to renumber the messages:
+				BmString uid = uidValidity + ":" + nestedList[l + 1].Text();
+				folder.uids.push_back(uid);
+			} else if (key.ICompare("FLAGS") == 0) {
+				unsigned flags = StringToFlags(nestedList[l + 1]);
+				folder.flags.push_back(flags);
+			} else if (key.ICompare("RFC822.SIZE") == 0) {
+				const BmString& sizeStr = nestedList[l + 1].Text();
+				msgSizes.push_back(atoi(sizeStr.String()));
+			} else
+				throw BM_network_error(BmString("answer to '")
+									   << cmd << "' contains unrequested key '" << key
+									   << "' in string list in line " << i + 1);
+		}
+		if (folder.uids.size() != i + 1)
+			throw BM_network_error(
+				BmString("answer to '") << cmd << "' is missing UID in line " << i + 1);
+		if (folder.flags.size() != i + 1)
+			throw BM_network_error(
+				BmString("answer to '") << cmd << "' is missing FLAGS in line " << i + 1);
+		if (msgSizes.size() != i + 1)
+			throw BM_network_error(
+				BmString("answer to '") << cmd << "' is missing RFC822.SIZE in line " << i + 1);
+	}
+
+	if (folder.uids.size() != msgCount)
+		throw BM_network_error(BmString("answer to '") << cmd << "' does not have enough UIDs");
+	if (folder.flags.size() != msgCount)
+		throw BM_network_error(BmString("answer to '") << cmd << "' does not have enough FLAGS");
+	if (msgSizes.size() != msgCount)
+		throw BM_network_error(
+			BmString("answer to '") << cmd << "' does not have enough RFC822.SIZEs");
+	folder.sizes = msgSizes;
+
+	// pull any flag-changes the server has for mail we already know about
+	// (marked read/replied/flagged elsewhere, or by another mail client):
+	ReconcilePulledFlags(folder, msgCount);
+
+	// compute total size of messages that are new to us:
+	for (uint32 i = 0; i < msgCount; i++) {
+		if (!mImapAccount->IsUIDDownloaded(folder.remoteName, folder.uids[i])) {
+			// msg is new (according to unknown UID)
+			mNewMsgTotalSize += msgSizes[i];
+			mNewMsgSizes.push_back(msgSizes[i]);
+			mNewMsgCount++;
+		} else {
+			// msg is old (according to known UID), we may have to remove it now:
+			BmString log;
+			bool shouldBeRemoved
+				= mImapAccount->ShouldUIDBeDeletedFromServer(folder.remoteName, folder.uids[i], log);
+			BM_LOG2(BM_LogRecv, log);
+			if (shouldBeRemoved)
+				mCleanupItems.push_back(std::make_pair(folderIdx, folder.uids[i]));
+		}
+	}
+
+	// remove local UIDs that are not listed on the server anymore:
+	BmString removedUids = mImapAccount->AdjustToCurrentServerUids(folder.remoteName, folder.uids);
+	BM_LOG(BM_LogRecv, removedUids);
+	return true;
+}
+
+/*------------------------------------------------------------------------------*\
 	StateCleanup()
-		-	deletes all old mails from server
+		-	deletes all old mails from server, one mailbox at a time
 \*------------------------------------------------------------------------------*/
 void
 BmImap::StateCleanup()
 {
-	BmString cmd;
-	uint32 count = (uint32)mCleanupMsgUIDs.size();
+	uint32 count = (uint32)mCleanupItems.size();
 	if (count == 0)
 		return;
-	for (uint32 i = 0; i < count; ++i) {
-		if (!DeleteMailFromServer(mCleanupMsgUIDs[i]))
+
+	uint32 done = 0;
+	for (uint32 f = 0; f < mFolders.size(); ++f) {
+		bool haveItemsForThisFolder = false;
+		for (uint32 i = 0; i < mCleanupItems.size(); ++i) {
+			if (mCleanupItems[i].first == f) {
+				haveItemsForThisFolder = true;
+				break;
+			}
+		}
+		if (!haveItemsForThisFolder)
+			continue;
+		if (!SelectFolder(mFolders[f].remoteName))
 			return;
-		float delta = 100.0f / float(count != 0 ? count : 1);
-		UpdateCleanupStatus(delta, i + 1);
+		for (uint32 i = 0; i < mCleanupItems.size(); ++i) {
+			if (mCleanupItems[i].first != f)
+				continue;
+			if (!DeleteMailFromServer(mCleanupItems[i].second))
+				return;
+			done++;
+			UpdateCleanupStatus(100.0f / float(count), done);
+		}
+		BmString cmd("EXPUNGE");
+		SendCommand(cmd);
+		if (!CheckForPositiveAnswer())
+			return;
 	}
-	mCleanupMsgUIDs.clear();
-	UpdateCleanupStatus(100.0, count);
+	mCleanupItems.clear();
+	UpdateCleanupStatus(0.0, done);
 }
 
 /*------------------------------------------------------------------------------*\
 	StateRetrieve()
-		-	retrieves all new mails from server
+		-	retrieves all new mails from server, one mailbox at a time
 \*------------------------------------------------------------------------------*/
 void
 BmImap::StateRetrieve()
 {
 	UpdateMailStatus(-1, NULL, 0);
-	BmString cmd;
 	mCurrMailNr = 1;
-	for (uint32 i = 0; mNewMsgCount > 0 && i < mMsgCount; ++i) {
-		if (mImapAccount->IsUIDDownloaded(mMsgUIDs[i])) {
+	for (uint32 f = 0; mNewMsgCount > 0 && f < mFolders.size(); ++f) {
+		if (!RetrieveOneFolder(mFolders[f]))
+			return;
+	}
+	if (mNewMsgCount)
+		UpdateMailStatus(100.0, "done", mNewMsgCount);
+	mCurrMailNr = 0;
+}
+
+/*------------------------------------------------------------------------------*\
+	RetrieveOneFolder( folder)
+		-	retrieves every new message of the given (already-checked) mailbox
+			and stores it into the mapped local folder.
+\*------------------------------------------------------------------------------*/
+bool
+BmImap::RetrieveOneFolder(BmImapFolderInfo& folder)
+{
+	bool haveNewInThisFolder = false;
+	for (uint32 i = 0; i < folder.uids.size(); ++i) {
+		if (!mImapAccount->IsUIDDownloaded(folder.remoteName, folder.uids[i])) {
+			haveNewInThisFolder = true;
+			break;
+		}
+	}
+	if (!haveNewInThisFolder)
+		return true;
+
+	if (!SelectFolder(folder.remoteName))
+		return false;
+
+	bool needExpunge = false;
+	for (uint32 i = 0; i < folder.uids.size(); ++i) {
+		if (mImapAccount->IsUIDDownloaded(folder.remoteName, folder.uids[i])) {
 			// msg is old (according to known UID), we skip it:
 			continue;
 		}
 		// fetch current mail
-		BmString serverUID = LocalUidToServerUid(mMsgUIDs[i]);
-		// TODO: May also add more stuff to FETCH, like "flags"
-		cmd = BmString("UID FETCH ") << serverUID << " body[]";
+		BmString serverUID = LocalUidToServerUid(folder.uids[i]);
+		// use BODY.PEEK[] rather than BODY[]: per RFC 3501 6.4.5, a plain
+		// BODY[<section>] fetch implicitly sets \Seen server-side as a
+		// side effect - we want the server's \Seen to reflect the user's
+		// actual read status (synced explicitly, see Stage 2 flag-sync),
+		// not "has Beam ever downloaded this message".
+		BmString cmd = BmString("UID FETCH ") << serverUID << " body.peek[]";
 		SendCommand(cmd);
 		time_t before = time(NULL);
 		if (!CheckForPositiveAnswer(mNewMsgSizes[mCurrMailNr - 1], false, true))
-			goto CLEAN_UP;
+			return false;
 		if (mAnswerText.Length() > ThePrefs->GetInt("LogSpeedThreshold", 100 * 1024)) {
 			time_t after = time(NULL);
 			time_t duration = after - before > 0 ? after - before : 1;
 			// log speed for mails that exceed a certain size:
 			BM_LOG(BM_LogRecv, BmString("Received mail of size ")
-								   << mAnswerText.Length() << " bytes in " << duration
-								   << " seconds => "
-								   << mAnswerText.Length() / (int32)duration / 1024.0 << "KB/s");
+									<< mAnswerText.Length() << " bytes in " << duration
+									<< " seconds => "
+									<< mAnswerText.Length() / (int32)duration / 1024.0 << "KB/s");
 		}
 		if ((uint32)mAnswerText.Length() != mNewMsgSizes[mCurrMailNr - 1]) {
 			// as this actually happens (what the heck?) we simply
@@ -791,42 +1181,49 @@ BmImap::StateRetrieve()
 		BM_LOG2(BM_LogRecv, "Creating mail...");
 		BmRef<BmMail> mail = new BmMail(mAnswerText, mImapAccount->Name());
 		if (mail->InitCheck() != B_OK)
-			goto CLEAN_UP;
+			return false;
 		// ...set IMAP UID - TODO: Use serverUID instead?
-		mail->ImapUID(mMsgUIDs[i]);
+		mail->ImapUID(folder.uids[i]);
+		mail->ImapFolder(folder.remoteName);
 		// ...set the message flags
-		uint32 flags = mMsgFlags[i];
-		if (flags & FLAG_ANSWERED)
-			mail->MarkAs("Replied");
-		else if (flags & FLAG_SEEN)
-			mail->MarkAs("Read");
-		else if (flags & FLAG_DRAFT)
-			mail->MarkAs("Draft");
-		// ...set default folder according to pop-account settings...
-		mail->SetDestFolderName(mImapAccount->HomeFolder());
+		uint32 flags = folder.flags[i];
+		if (flags & BM_IMAP_FLAG_ANSWERED)
+			mail->MarkAs(BM_MAIL_STATUS_REPLIED);
+		else if (flags & BM_IMAP_FLAG_SEEN)
+			mail->MarkAs(BM_MAIL_STATUS_READ);
+		else if (flags & BM_IMAP_FLAG_DRAFT)
+			mail->MarkAs(BM_MAIL_STATUS_DRAFT);
+		mail->SetFlagged((flags & BM_IMAP_FLAG_FLAGGED) != 0);
+		// ...set destination folder according to the folder-mapping...
+		mail->SetDestFolderName(folder.localSubPath);
 		// ...execute mail-filters for this mail...
 		BM_LOG2(BM_LogRecv, "...applying filters (in memory)...");
 		mail->ApplyInboundFilters();
 		// ...and store mail on disk:
 		BM_LOG2(BM_LogRecv, "...storing mail...");
 		if (!mail->Store())
-			goto CLEAN_UP;
+			return false;
 		BM_LOG2(BM_LogRecv, "...done");
-		mImapAccount->MarkUIDAsDownloaded(mMsgUIDs[i]);
+		mImapAccount->MarkUIDAsDownloaded(folder.remoteName, folder.uids[i]);
 		//	delete the retrieved message if required to do so immediately:
 		BmString log;
-		bool shouldBeDeleted = mImapAccount->ShouldUIDBeDeletedFromServer(mMsgUIDs[i], log);
+		bool shouldBeDeleted
+			= mImapAccount->ShouldUIDBeDeletedFromServer(folder.remoteName, folder.uids[i], log);
 		BM_LOG2(BM_LogRecv, log);
 		if (shouldBeDeleted) {
-			if (!DeleteMailFromServer(mMsgUIDs[i]))
-				goto CLEAN_UP;
+			if (!DeleteMailFromServer(folder.uids[i]))
+				return false;
+			needExpunge = true;
 		}
 		mCurrMailNr++;
 	}
-	if (mNewMsgCount)
-		UpdateMailStatus(100.0, "done", mNewMsgCount);
-CLEAN_UP:
-	mCurrMailNr = 0;
+	if (needExpunge) {
+		BmString cmd("EXPUNGE");
+		SendCommand(cmd);
+		if (!CheckForPositiveAnswer())
+			return false;
+	}
+	return true;
 }
 
 /*------------------------------------------------------------------------------*\
@@ -848,7 +1245,8 @@ BmImap::LocalUidToServerUid(const BmString& uid) const
 
 /*------------------------------------------------------------------------------*\
 	DeleteMailFromServer(uid)
-		-	deletes the mail with the given UID
+		-	deletes the mail with the given UID (from the currently SELECTed
+			mailbox; the caller is responsible for sending EXPUNGE afterwards)
 \*------------------------------------------------------------------------------*/
 bool
 BmImap::DeleteMailFromServer(const BmString& uid)
@@ -858,7 +1256,6 @@ BmImap::DeleteMailFromServer(const BmString& uid)
 	BmString cmd;
 	cmd = BmString("UID STORE ") << serverUID << " flags.silent (\\deleted)";
 	SendCommand(cmd);
-	mExpungeCount++;
 	return CheckForPositiveAnswer();
 }
 
@@ -869,12 +1266,6 @@ BmImap::DeleteMailFromServer(const BmString& uid)
 void
 BmImap::StateDisconnect()
 {
-	if (mExpungeCount) {
-		BmString cmd("EXPUNGE");
-		SendCommand(cmd);
-		if (!CheckForPositiveAnswer())
-			return;
-	}
 	Quit(true);
 }
 
@@ -977,32 +1368,32 @@ BmImap::FlagsToString(uint32 flags)
 {
 	BmString string;
 	bool first = true;
-	if (flags & FLAG_SEEN) {
+	if (flags & BM_IMAP_FLAG_SEEN) {
 		string << "\\Seen";
 		first = false;
 	}
-	if (flags & FLAG_ANSWERED) {
+	if (flags & BM_IMAP_FLAG_ANSWERED) {
 		if (first)
 			string << "\\Answered";
 		else
 			string << " \\Answered";
 		first = false;
 	}
-	if (flags & FLAG_FLAGGED) {
+	if (flags & BM_IMAP_FLAG_FLAGGED) {
 		if (first)
 			string << "\\Flagged";
 		else
 			string << " \\Flagged";
 		first = false;
 	}
-	if (flags & FLAG_DELETED) {
+	if (flags & BM_IMAP_FLAG_DELETED) {
 		if (first)
 			string << "\\Deleted";
 		else
 			string << " \\Deleted";
 		first = false;
 	}
-	if (flags & FLAG_DRAFT) {
+	if (flags & BM_IMAP_FLAG_DRAFT) {
 		if (first)
 			string << "\\Draft";
 		else
@@ -1018,15 +1409,15 @@ BmImap::StringToFlags(const BmImapNestedStringList& flagsString)
 	uint32 flags = 0;
 	for (uint32 i = 0; i < flagsString.Size(); ++i) {
 		if (flagsString[i].Text() == "\\Seen")
-			flags |= FLAG_SEEN;
+			flags |= BM_IMAP_FLAG_SEEN;
 		else if (flagsString[i].Text() == "\\Answered")
-			flags |= FLAG_ANSWERED;
+			flags |= BM_IMAP_FLAG_ANSWERED;
 		else if (flagsString[i].Text() == "\\Flagged")
-			flags |= FLAG_FLAGGED;
+			flags |= BM_IMAP_FLAG_FLAGGED;
 		else if (flagsString[i].Text() == "\\Deleted")
-			flags |= FLAG_DELETED;
+			flags |= BM_IMAP_FLAG_DELETED;
 		else if (flagsString[i].Text() == "\\Draft")
-			flags |= FLAG_DRAFT;
+			flags |= BM_IMAP_FLAG_DRAFT;
 	}
 	return flags;
 }

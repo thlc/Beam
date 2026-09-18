@@ -156,8 +156,11 @@ BmMailFilter::Execute(BmMail* mail)
 
 	BmRef<BmListModelItem> accItem = TheRecvAccountList->FindItemByKey(mail->AccountName());
 	BmRecvAccount* recvAcc = dynamic_cast<BmRecvAccount*>(accItem.Get());
-	if (!mail->Outbound() && recvAcc) {
-		// set default folder for this mail according to its receiving account
+	if (!mail->Outbound() && recvAcc && !mail->DestFolderName().Length()) {
+		// set default folder for this mail according to its receiving account,
+		// but only if no destination has been set already (e.g. IMAP's
+		// per-folder mapping, which must survive filter execution unless a
+		// filter explicitly reroutes the mail):
 		mail->SetDestFolderName(recvAcc->HomeFolder());
 	}
 

@@ -61,6 +61,7 @@ struct BmIndexDesc {
 enum Columns {
 	COL_STATUS_I = 0,
 	COL_ATTACHMENTS_I,
+	COL_FLAGGED_I,
 	COL_PRIORITY_I,
 	COL_FROM,
 	COL_SUBJECT,
@@ -178,6 +179,11 @@ BmMailRefItem::UpdateView(BmUpdFlags flags, bool redraw, uint32 updColBitmap)
 		}
 		updColBitmap |= (1UL << COL_ATTACHMENTS | 1UL << COL_ATTACHMENTS_I);
 	}
+	if (flags & BmMailRef::UPD_FLAGGED) {
+		icon = ref->IsFlagged() ? TheResources->IconByName("Flagged") : NULL;
+		SetColumnContent(COL_FLAGGED_I, icon);
+		updColBitmap |= (1UL << COL_FLAGGED_I);
+	}
 	if (flags & BmMailRef::UPD_PRIORITY) {
 		BmString priority = BmString("Priority_") << ref->Priority();
 		if ((icon = TheResources->IconByName(priority)) != NULL) {
@@ -239,6 +245,9 @@ BmMailRefItem::GetNumValueForColumn(int32 column_index) const
 	} else if (column_index == COL_ATTACHMENTS_I || column_index == COL_ATTACHMENTS) {
 		return ref->HasAttachments() ? 0 : 1;
 		// show mails with attachment at top
+	} else if (column_index == COL_FLAGGED_I) {
+		return ref->IsFlagged() ? 0 : 1;
+		// show flagged mails at top
 	} else if (column_index == COL_PRIORITY_I || column_index == COL_PRIORITY) {
 		int16 prio = int16(atoi(ref->Priority().String()));
 		return (prio >= 1 && prio <= 5) ? prio : 3;
@@ -451,6 +460,9 @@ BmMailRefView::BmMailRefView(int32 width, int32 height)
 	AddColumn(new CLVColumn("A", 18.0,
 		flags | CLV_NOT_RESIZABLE | CLV_COLDATA_NUMBER | CLV_COLTYPE_BITMAP, 18.0,
 		"(A)ttachments [icon]"));
+	AddColumn(new CLVColumn("F", 18.0,
+		flags | CLV_NOT_RESIZABLE | CLV_COLDATA_NUMBER | CLV_COLTYPE_BITMAP, 18.0,
+		"(F)lagged [icon]"));
 	AddColumn(new CLVColumn("P", 18.0,
 		flags | CLV_NOT_RESIZABLE | CLV_COLDATA_NUMBER | CLV_COLTYPE_BITMAP, 18.0,
 		"(P)riority [icon]"));
@@ -479,7 +491,7 @@ BmMailRefView::BmMailRefView(int32 width, int32 height)
 	SetSortFunction(CLVEasyItem::CompareItems);
 	SetSortKey(COL_WHEN_CREATED);
 	SetSortMode(COL_WHEN_CREATED, Descending, false);
-	int32 displayOrder[] = {COL_STATUS_I, COL_ATTACHMENTS_I, COL_NAME, COL_SUBJECT,
+	int32 displayOrder[] = {COL_STATUS_I, COL_ATTACHMENTS_I, COL_FLAGGED_I, COL_NAME, COL_SUBJECT,
 		COL_WHEN_CREATED, COL_SIZE, COL_IDENTITY, COL_ACCOUNT, -1, -1, -1, -1, -1, -1, -1, -1, -1,
 		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
 	SetDisplayOrder(displayOrder);
@@ -1198,6 +1210,7 @@ BmMailRefView::AddMailRefMenu(BMenu* menu, BHandler* target, bool isContextMenu)
 	if (isContextMenu)
 		statusMenu->SetFont(&font);
 	menu->AddItem(statusMenu);
+	AddItemToMenu(menu, CreateMenuItem("Toggle flagged", BMM_TOGGLE_FLAGGED), target);
 	menu->AddSeparatorItem();
 
 	BmMenuController* moveMenu = new BmMenuController(MENU_MOVE, target, new BMessage(BMM_MOVE),

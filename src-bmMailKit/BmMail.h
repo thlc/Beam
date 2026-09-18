@@ -52,6 +52,8 @@ extern IMPEXPBMMAILKIT const char* BM_MAIL_ATTR_IDENTITY;
 extern IMPEXPBMMAILKIT const char* BM_MAIL_ATTR_MARGIN;
 extern IMPEXPBMMAILKIT const char* BM_MAIL_ATTR_WHEN_CREATED;
 extern IMPEXPBMMAILKIT const char* BM_MAIL_ATTR_IMAP_UID;
+extern IMPEXPBMMAILKIT const char* BM_MAIL_ATTR_IMAP_FOLDER;
+extern IMPEXPBMMAILKIT const char* BM_MAIL_ATTR_FLAGGED;
 
 extern IMPEXPBMMAILKIT const char* BM_FIELD_BCC;
 extern IMPEXPBMMAILKIT const char* BM_FIELD_CC;
@@ -196,6 +198,8 @@ public:
 	inline const BmString& IdentityName() const { return mIdentityName; }
 	inline const BmString& DestFolderName() const { return mDestFolderName; }
 	inline const BmString& ImapUID() const { return mImapUID; }
+	inline const BmString& ImapFolder() const { return mImapFolder; }
+	inline bool IsFlagged() const { return mFlagged; }
 
 	// setters:
 	inline void BumpRightMargin(int32 i) { mRightMargin = MAX(i, mRightMargin); }
@@ -208,6 +212,8 @@ public:
 	inline void MoveToTrash(bool b) { mMoveToTrash = b; }
 	inline void SuggestedCharset(const BmString& s) { mSuggestedCharset = s; }
 	inline void ImapUID(const BmString& s) { mImapUID = s; }
+	inline void ImapFolder(const BmString& s) { mImapFolder = s; }
+	void SetFlagged(bool b);
 
 	static const int32 BM_READ_MAIL_JOB = 1;
 
@@ -269,6 +275,13 @@ private:
 	BmString mImapUID;
 	// UID for this mail as retrieved from the IMAP
 	// server.
+	BmString mImapFolder;
+	// name of the remote IMAP mailbox this mail was retrieved from
+	// (empty for non-IMAP mail); needed to route local flag changes
+	// back to the correct remote mailbox.
+	bool mFlagged;
+	// mirrors IMAP's \Flagged flag; independent of mStatus/mDefaultStatus
+	// since Beam's status attribute is a single mutually-exclusive value.
 	status_t mInitCheck;
 
 	// Hide copy-constructor and assignment:

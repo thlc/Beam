@@ -59,6 +59,8 @@ const char* BM_MAIL_ATTR_IDENTITY = "MAIL:beam/identity";
 const char* BM_MAIL_ATTR_MARGIN = "MAIL:beam/margin";
 const char* BM_MAIL_ATTR_WHEN_CREATED = "MAIL:beam/when-created";
 const char* BM_MAIL_ATTR_IMAP_UID = "MAIL:beam/imap-uid";
+const char* BM_MAIL_ATTR_IMAP_FOLDER = "MAIL:beam/imap-folder";
+const char* BM_MAIL_ATTR_FLAGGED = "MAIL:beam/flagged";
 
 const char* BM_FIELD_BCC = "Bcc";
 const char* BM_FIELD_CC = "Cc";
@@ -152,6 +154,7 @@ BmMail::BmMail(bool outbound)
 	  mMailRef(NULL),
 	  mHeader(NULL),
 	  mBody(NULL),
+	  mFlagged(false),
 	  mInitCheck(B_NO_INIT),
 	  mOutbound(outbound),
 	  mRightMargin(ThePrefs->GetInt("MaxLineLen")),
@@ -184,6 +187,7 @@ BmMail::BmMail(const BmString& msgText, const BmString account)
 	  mHeader(NULL),
 	  mBody(NULL),
 	  mMailRef(NULL),
+	  mFlagged(false),
 	  mInitCheck(B_NO_INIT),
 	  mOutbound(false),
 	  mRightMargin(ThePrefs->GetInt("MaxLineLen")),
@@ -208,6 +212,7 @@ BmMail::BmMail(BmMailRef* ref)
 	  mHeader(NULL),
 	  mBody(NULL),
 	  mMailRef(ref),
+	  mFlagged(false),
 	  mInitCheck(B_NO_INIT),
 	  mOutbound(false),
 	  mRightMargin(ThePrefs->GetInt("MaxLineLen")),
@@ -366,6 +371,8 @@ BmMail::StartJob()
 		BM_LOG2(BM_LogMailParse, BmString("initializing BmMail from msgtext"));
 		mIdentityName = mMailRef->Identity();
 		mImapUID = mMailRef->ImapUID();
+		mImapFolder = mMailRef->ImapFolder();
+		mFlagged = mMailRef->IsFlagged();
 		SetTo(mailText, mMailRef->Account());
 		BM_LOG2(BM_LogMailParse, BmString("Done, mail is initialized"));
 	} catch (BM_error& e) {
@@ -560,6 +567,9 @@ BmMail::StoreAttributes(BNode& mailNode, const BmString& status, bigtime_t whenC
 		mIdentityName.Length() + 1);
 	mailNode.WriteAttr(
 		BM_MAIL_ATTR_IMAP_UID, B_STRING_TYPE, 0, mImapUID.String(), mImapUID.Length() + 1);
+	mailNode.WriteAttr(BM_MAIL_ATTR_IMAP_FOLDER, B_STRING_TYPE, 0, mImapFolder.String(),
+		mImapFolder.Length() + 1);
+	mailNode.WriteAttr(BM_MAIL_ATTR_FLAGGED, B_BOOL_TYPE, 0, &mFlagged, sizeof(bool));
 	//
 	if (mOutbound) {
 		// write MAIL:flags in order to cooperate nicely with MDR:
@@ -1189,6 +1199,37 @@ BmMail::MarkAs(const char* status)
 										  "Result: ")
 								 << strerror(err));
 			mailNode.WriteAttr(BM_MAIL_ATTR_STATUS, B_STRING_TYPE, 0, status, strlen(status) + 1);
+		}
+	} catch (BM_error& e) {
+		BM_SHOWERR(e.what());
+	}
+}
+
+/*------------------------------------------------------------------------------*\
+	SetFlagged()
+		-
+\*------------------------------------------------------------------------------*/
+void
+BmMail::SetFlagged(bool b)
+{
+	if (InitCheck() != B_OK)
+		return;
+	try {
+		mFlagged = b;
+		if (mMailRef)
+			mMailRef->SetFlagged(b);
+		else {
+			BNode mailNode;
+			status_t err;
+			entry_ref eref;
+			if (mEntry.InitCheck() != B_OK)
+				return;
+			mEntry.GetRef(&eref);
+			if ((err = mailNode.SetTo(&eref)) != B_OK)
+				BM_THROW_RUNTIME(BmString("Could not create node for current mail-file.\n\n "
+										  "Result: ")
+								 << strerror(err));
+			mailNode.WriteAttr(BM_MAIL_ATTR_FLAGGED, B_BOOL_TYPE, 0, &b, sizeof(bool));
 		}
 	} catch (BM_error& e) {
 		BM_SHOWERR(e.what());

@@ -180,6 +180,50 @@ MarkMailsAs(void* data)
 }
 
 /*------------------------------------------------------------------------------*\
+	ToggleMailsFlagged( msg)
+		-	toggles the \Flagged-equivalent state for all mailref's contained
+			in the given message: if any of them is not yet flagged, all get
+			flagged; if all are already flagged, all get unflagged.
+		-	this is a thread-entry func.
+\*------------------------------------------------------------------------------*/
+static int32
+ToggleMailsFlagged(void* data)
+{
+	BMessage* msg = static_cast<BMessage*>(data);
+	if (!msg)
+		return B_OK;
+	BmMailRefVect* refVect = NULL;
+	msg->FindPointer(BeamApplication::MSG_MAILREF_VECT, (void**)&refVect);
+	if (refVect) {
+		bool allFlagged = true;
+		BmMailRefVect::iterator iter;
+		for (iter = refVect->begin(); iter != refVect->end(); ++iter) {
+			if (!iter->Get()->IsFlagged()) {
+				allFlagged = false;
+				break;
+			}
+		}
+		bool newFlagged = !allFlagged;
+		BmMailRef* mailRef;
+		int i = 0;
+		for (iter = refVect->begin(); !beamApp->IsQuitting() && iter != refVect->end(); ++iter) {
+			mailRef = iter->Get();
+			BM_LOG(BM_LogApp, BmString("setting mail <")
+								  << mailRef->TrackerName() << "> flagged to "
+								  << (newFlagged ? "true" : "false"));
+			mailRef->SetFlagged(newFlagged);
+			if (++i % 100 == 0)
+				snooze(500 * 1000);
+			// give mail monitor a chance to catch up...
+		}
+	}
+	delete refVect;
+	// freeing all references to mailrefs contained in vector
+	delete msg;
+	return B_OK;
+}
+
+/*------------------------------------------------------------------------------*\
 	MoveMails( msg)
 		-	moves mails to a new folder.
 		-	this is a thread-entry func.
@@ -1102,6 +1146,12 @@ BeamApplication::MessageReceived(BMessage* msg)
 			{
 				DetachCurrentMessage();
 				SlaveHandler.Run("Msg-Marker", MarkMailsAs, msg);
+				break;
+			}
+			case BMM_TOGGLE_FLAGGED:
+			{
+				DetachCurrentMessage();
+				SlaveHandler.Run("Msg-Flagger", ToggleMailsFlagged, msg);
 				break;
 			}
 			case BMM_MOVE:

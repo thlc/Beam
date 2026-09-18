@@ -379,6 +379,7 @@ BmMainWindow::MessageReceived(BMessage* msg)
 			}
 			case BMM_MOVE:
 			case BMM_MARK_AS:
+			case BMM_TOGGLE_FLAGGED:
 			case BMM_PRINT:
 			case BMM_REDIRECT:
 			case BMM_REPLY:

@@ -10,6 +10,8 @@
 #define _BmImap_h
 
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include <Message.h>
 
@@ -17,6 +19,8 @@
 
 #include "BmImapNestedStringList.h"
 #include "BmNetJobModel.h"
+
+using std::pair;
 
 class BmImapAccount;
 
@@ -94,15 +98,55 @@ private:
 	void ExtractBase64(const BmString& text, BmString& base64);
 	bool StartEncryption(const char* encType);
 
+	// per-mailbox info & state, one entry per remote folder that is
+	// synced for this account (populated by StateList(), filled in
+	// by StateCheck(), consumed by StateCleanup()/StateRetrieve()):
+	struct BmImapFolderInfo {
+		BmString remoteName;
+		// mailbox name as reported by the server (raw, IMAP-UTF7)
+		BmString localSubPath;
+		// local folder (relative to mailbox-root) this is synced into
+		char delimiter;
+		// server's hierarchy-delimiter for this mailbox, 0 if none
+		bool noSelect;
+		// true if server marked this mailbox with \Noselect
+		uint32 msgCount;
+		// number of msgs found on server, in this mailbox
+		BmString uidValidity;
+		// this mailbox's UIDVALIDITY, as reported by SELECT
+		vector<BmString> uids;
+		// one "uidvalidity:uid" per message, size==msgCount
+		vector<uint32> flags;
+		// one flag-bitmask per message, size==msgCount
+		vector<uint32> sizes;
+		// one rfc822.size per message, size==msgCount
+
+		BmImapFolderInfo()
+			: delimiter(0)
+			, noSelect(false)
+			, msgCount(0)
+		{
+		}
+	};
+
 	// internal functions:
 	void StateConnect();
 	void StateCapa();
 	void StateStartTLS();
 	void StateAuth();
+	void StateList();
 	void StateCheck();
 	void StateCleanup();
 	void StateRetrieve();
 	void StateDisconnect();
+
+	bool CheckOneFolder(BmImapFolderInfo& folder, uint32 folderIdx);
+	bool RetrieveOneFolder(BmImapFolderInfo& folder);
+	bool SelectFolder(const BmString& remoteName, uint32* existsCount = NULL,
+		BmString* uidValidity = NULL);
+	bool EnsureLocalFolderExists(const BmString& subPath);
+	void FlushPendingOutboundFlags(const BmImapFolderInfo& folder);
+	void ReconcilePulledFlags(const BmImapFolderInfo& folder, uint32 msgCount);
 
 	BmString LocalUidToServerUid(const BmString& uid) const;
 	bool DeleteMailFromServer(const BmString& uid);
@@ -122,14 +166,16 @@ private:
 	// unique message ID, this is used if a
 	// received message has no UID.
 	BmRef<BmImapAccount> mImapAccount;
-	// Info about our pop-account
-	vector<BmString> mMsgUIDs;
-	// array of unique-IDs, one for each message
+	// Info about our imap-account
+
+	vector<BmImapFolderInfo> mFolders;
+	// all remote folders considered for syncing
 	enum States {
 		IMAP_CONNECT = 0,
 		IMAP_CAPA,
 		IMAP_STARTTLS,
 		IMAP_AUTH,
+		IMAP_LIST,
 		IMAP_CHECK,
 		IMAP_CLEANUP,
 		IMAP_RETRIEVE,
@@ -137,35 +183,23 @@ private:
 		IMAP_DONE,
 		IMAP_FINAL
 	};
-	vector<uint32> mMsgFlags;
-	// an array of message flags, one for each message
-	uint32 mMsgCount;
-	// number of msgs found on server
 	uint32 mCurrMailNr;
-	// nr of currently handled mail (0 if none)
+	// nr of currently handled mail (0 if none), counted across all folders
 	uint32 mNewMsgCount;
-	// number of msgs to be received
-	vector<uint32> mNewMsgSizes;
-	// sizes of msgs to be received
+	// number of msgs to be received, summed over all folders
 	uint32 mNewMsgTotalSize;
-	// total-size of msgs to be received
-	vector<BmString> mCleanupMsgUIDs;
-	// UIDs of msgs to be deleted
+	// total-size of msgs to be received, summed over all folders
+	vector<uint32> mNewMsgSizes;
+	// sizes of msgs to be received, in the order they will be retrieved
+	// (flattened across all folders)
+	vector<pair<uint32, BmString> > mCleanupItems;
+	// (folder-index, uid) pairs of msgs to be deleted from server
 	BmString mSupportedAuthTypes;
 	// list of auth-types the server indicates to support
 	bool mServerSupportsTLS;
 	// whether or not the server knows about STLS
-	uint32 mExpungeCount;
-	// number of mails that need to be expunged
 	int32 mState;
 	// current IMAP-state (refer enum below)
-	enum {
-		FLAG_SEEN = 1 << 0,
-		FLAG_ANSWERED = 1 << 1,
-		FLAG_FLAGGED = 1 << 2,
-		FLAG_DELETED = 1 << 3,
-		FLAG_DRAFT = 1 << 4
-	};
 
 	bool mTaggedMode;
 	// whether or not we should send/expect tagged lines

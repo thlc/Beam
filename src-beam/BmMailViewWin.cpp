@@ -275,6 +275,7 @@ BmMailViewWin::MessageReceived(BMessage* msg)
 				break;
 			}
 			case BMM_MARK_AS:
+			case BMM_TOGGLE_FLAGGED:
 			case BMM_REDIRECT:
 			case BMM_REPLY:
 			case BMM_REPLY_LIST:
